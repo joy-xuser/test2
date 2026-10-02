@@ -121,8 +121,15 @@
             z-index: 10;
         }
     </style>
+    <!-- YouTube Official IFrame API -->
+    <script src="https://www.youtube.com/iframe_api"></script>
 </head>
 <body>
+    <!-- Hidden Viewable YouTube Player container (Inside viewport so browser doesn't throttle audio) -->
+    <div id="yt-player-box" style="position: fixed; bottom: 8px; left: 8px; width: 200px; height: 120px; opacity: 0.02; pointer-events: none; z-index: 1; border-radius: 8px; overflow: hidden;">
+        <div id="yt-player"></div>
+    </div>
+
     <!-- Overlay for better text readability -->
     <div class="absolute inset-0 bg-black/25 z-0 pointer-events-none"></div>
 
@@ -223,7 +230,7 @@
                         </div>
                         
                         <!-- Track Details -->
-                        <h4 class="font-semibold text-white text-[17px] tracking-wide truncate mb-0.5" id="current-track-title">গান যোগ করুন</h4>
+                        <h4 class="font-semibold text-white text-[17px] tracking-wide truncate mb-0.5" id="current-track-title">গান যোগ করতে ইউজার আইকনে ক্লিক করুন</h4>
                         <span class="text-[13px] text-gray-300 truncate mb-4" id="current-track-artist">শিল্পী নির্বাচন নেই</span>
                         
                         <!-- Progress Bar & Timestamps -->
@@ -454,10 +461,16 @@
         refreshAllTracks();
 
         /* ==========================================================
-           বিজ্ঞাপনহীন সরাসরি অডিও ইঞ্জিন (PURE NATIVE HTML5 AUDIO)
+           ডুয়েল ইঞ্জিন অডিও সিস্টেম (HTML5 + YOUTUBE BACKGROUND ENGINE)
            ========================================================== */
-        const audio = new Audio();
-        audio.preload = 'auto';
+        const htmlAudio = new Audio();
+        htmlAudio.preload = 'auto';
+
+        let ytPlayer = null;
+        let ytPlayerReady = false;
+        let pendingVideoId = null;
+        let activePlayerType = 'youtube'; // 'youtube' or 'html5'
+        let ytProgressTimer = null;
 
         let currentVolume = 1;
         let isMuted = false;
@@ -470,7 +483,7 @@
         let isShuffle = false;
         let repeatMode = 'all'; // 'all', 'one', 'off'
 
-        // UI রেফারেন্স
+        // UI এলিমেন্টস
         const playPauseBtn = document.getElementById('play-pause-btn');
         const playIcon = playPauseBtn.querySelector('i');
         const prevBtn = document.getElementById('prev-btn');
@@ -493,7 +506,7 @@
         const muteIcon = document.getElementById('mute-icon');
 
         function formatTime(seconds) {
-            if (isNaN(seconds) || seconds === null || seconds === undefined) return "00:00";
+            if (isNaN(seconds) || seconds === null || seconds === undefined || seconds < 0) return "00:00";
             const m = Math.floor(seconds / 60).toString().padStart(2, '0');
             const s = Math.floor(seconds % 60).toString().padStart(2, '0');
             return `${m}:${s}`;
@@ -534,16 +547,30 @@
             const clamped = Math.max(0, Math.min(1, val));
             currentVolume = clamped;
             isMuted = clamped === 0;
-            audio.volume = clamped;
-            audio.muted = isMuted;
+            
+            htmlAudio.volume = clamped;
+            htmlAudio.muted = isMuted;
+
+            if (ytPlayer && ytPlayerReady && typeof ytPlayer.setVolume === 'function') {
+                if (isMuted) {
+                    ytPlayer.mute();
+                } else {
+                    ytPlayer.unMute();
+                    ytPlayer.setVolume(Math.round(clamped * 100));
+                }
+            }
             updateVolumeUI(clamped);
         }
 
         function extractVideoID(url) {
             if (!url) return null;
-            const regExp = /(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=))([\w-]{11})/;
+            url = url.trim();
+            if (/^[a-zA-Z0-9_-]{11}$/.test(url)) return url;
+            const regExp = /(?:youtu\.be\/|youtube(?:-nocookie)?\.com\/(?:.*v=|.*\/v\/|embed\/|shorts\/))([a-zA-Z0-9_-]{11})/;
             const match = url.match(regExp);
-            return (match && match[1]) ? match[1] : (url.length === 11 ? url : null);
+            if (match && match[1]) return match[1];
+            const fallback = url.match(/([a-zA-Z0-9_-]{11})/);
+            return fallback ? fallback[1] : null;
         }
 
         function extractPlaylistID(url) {
@@ -557,72 +584,120 @@
         }
 
         /* ==========================================================
-           ১০০% বিজ্ঞাপনহীন অডিও স্ট্রিম প্রক্সি ইঞ্জিন (HIGH-SPEED & RELIABLE)
+           YOUTUBE IFRAME INITIALIZER (গ্যারান্টেড প্লেব্যাক ইঞ্জিন)
            ========================================================== */
-        async function fetchAdFreeAudioStreamUrl(videoId) {
-            const cachedUrl = sessionStorage.getItem('af_stream_' + videoId);
-            if (cachedUrl) return cachedUrl;
-
-            // ভেরিফাইড সক্রিয় ইনভিডিয়াস ও পাইপড এন্ডপয়েন্ট
-            const streamEndpoints = [
-                `https://pipedapi.kavin.rocks/streams/${videoId}`,
-                `https://api.piped.privacy.com.de/streams/${videoId}`,
-                `https://invidious.nerdvpn.de/api/v1/videos/${videoId}?fields=adaptiveFormats`,
-                `https://inv.nadeko.net/api/v1/videos/${videoId}?fields=adaptiveFormats`,
-                `https://yewtu.be/api/v1/videos/${videoId}?fields=adaptiveFormats`
-            ];
-
-            for (const endpoint of streamEndpoints) {
-                // CORS বাইপাস প্রক্সিসহ ট্রাই
-                const testUrls = [
-                    endpoint,
-                    `https://api.allorigins.win/raw?url=${encodeURIComponent(endpoint)}`
-                ];
-
-                for (const url of testUrls) {
-                    try {
-                        const controller = new AbortController();
-                        const timeoutId = setTimeout(() => controller.abort(), 2600);
-                        const res = await fetch(url, { signal: controller.signal });
-                        clearTimeout(timeoutId);
-
-                        if (!res.ok) continue;
-                        const data = await res.json();
-
-                        // Piped অডিও এক্সট্র্যাক্ট
-                        if (Array.isArray(data.audioStreams) && data.audioStreams.length > 0) {
-                            const bestStream = data.audioStreams.find(s => s.format === 'M4A' || s.mimeType?.includes('audio/mp4')) || data.audioStreams[0];
-                            if (bestStream && bestStream.url) {
-                                sessionStorage.setItem('af_stream_' + videoId, bestStream.url);
-                                return bestStream.url;
-                            }
-                        }
-
-                        // Invidious অডিও এক্সট্র্যাক্ট
-                        if (Array.isArray(data.adaptiveFormats)) {
-                            const audioFormats = data.adaptiveFormats.filter(f => f.type && f.type.startsWith('audio/'));
-                            if (audioFormats.length > 0) {
-                                const bestAudio = audioFormats.find(f => (f.type && f.type.includes('mp4')) || f.container === 'm4a') || audioFormats[0];
-                                if (bestAudio && bestAudio.url) {
-                                    sessionStorage.setItem('af_stream_' + videoId, bestAudio.url);
-                                    return bestAudio.url;
-                                }
-                            }
-                        }
-                    } catch(e) {
-                        // পরবর্তী ইনস্ট্যান্সে চলে যাবে
+        function initYouTubePlayer() {
+            if (ytPlayer) return;
+            if (window.YT && window.YT.Player) {
+                ytPlayer = new YT.Player('yt-player', {
+                    height: '120',
+                    width: '200',
+                    playerVars: {
+                        'autoplay': 1,
+                        'controls': 0,
+                        'disablekb': 1,
+                        'fs': 0,
+                        'playsinline': 1,
+                        'rel': 0,
+                        'enablejsapi': 1
+                    },
+                    events: {
+                        'onReady': onPlayerReady,
+                        'onStateChange': onPlayerStateChange,
+                        'onError': onPlayerError
                     }
+                });
+            }
+        }
+
+        window.onYouTubeIframeAPIReady = function() {
+            initYouTubePlayer();
+        };
+
+        // যদি API স্ক্রিপ্ট ইতিমধ্যেই লোড হয়ে গিয়ে থাকে
+        if (window.YT && window.YT.Player) {
+            initYouTubePlayer();
+        }
+
+        function onPlayerReady(event) {
+            ytPlayerReady = true;
+            try {
+                ytPlayer.unMute();
+                ytPlayer.setVolume(Math.round(currentVolume * 100));
+            } catch(e) {}
+
+            if (pendingVideoId) {
+                const vid = pendingVideoId;
+                pendingVideoId = null;
+                try {
+                    ytPlayer.loadVideoById(vid);
+                    ytPlayer.playVideo();
+                } catch(e) {
+                    console.error("Auto-start error:", e);
                 }
             }
+        }
 
-            // চূড়ান্ত আল্ট্রা-ফাস্ট ডিরেক্ট অডিও ফলব্যাক লিঙ্ক
-            return `https://invidious.nerdvpn.de/latest_version?id=${videoId}&itag=140&listen=1`;
+        function onPlayerStateChange(event) {
+            if (activePlayerType !== 'youtube') return;
+
+            if (event.data === YT.PlayerState.PLAYING) {
+                isPlaying = true;
+                setPlayIcon(true);
+                if (artLoader) artLoader.classList.add('hidden');
+                startYTProgressLoop();
+
+                const dur = ytPlayer.getDuration();
+                if (dur > 0) totalTimeDisplay.textContent = formatTime(dur);
+            } else if (event.data === YT.PlayerState.PAUSED) {
+                isPlaying = false;
+                setPlayIcon(false);
+                stopYTProgressLoop();
+            } else if (event.data === YT.PlayerState.BUFFERING) {
+                if (artLoader) artLoader.classList.remove('hidden');
+            } else if (event.data === YT.PlayerState.ENDED) {
+                stopYTProgressLoop();
+                playNextTrack();
+            }
+            updateActiveTrackUI();
+        }
+
+        function onPlayerError(err) {
+            console.warn("YouTube player error:", err);
+            if (artLoader) artLoader.classList.add('hidden');
+            isPlaying = false;
+            setPlayIcon(false);
+            if (err && (err.data === 150 || err.data === 101)) {
+                trackArtistDisplay.textContent = "ভিডিওর মালিক এমবেড বন্ধ রেখেছে। অন্য গান চেষ্টা করুন।";
+            }
+        }
+
+        function startYTProgressLoop() {
+            stopYTProgressLoop();
+            ytProgressTimer = setInterval(() => {
+                if (activePlayerType === 'youtube' && ytPlayer && ytPlayerReady && typeof ytPlayer.getCurrentTime === 'function') {
+                    const cur = ytPlayer.getCurrentTime();
+                    const dur = ytPlayer.getDuration();
+                    if (dur > 0) {
+                        updateProgressBar((cur / dur) * 100);
+                        currentTimeDisplay.textContent = formatTime(cur);
+                        totalTimeDisplay.textContent = formatTime(dur);
+                    }
+                }
+            }, 500);
+        }
+
+        function stopYTProgressLoop() {
+            if (ytProgressTimer) {
+                clearInterval(ytProgressTimer);
+                ytProgressTimer = null;
+            }
         }
 
         /* ==========================================================
-           গান প্লে করার কোর ফাংশন
+           গান প্লে করার মাস্টার ফাংশন (Instant Playback)
            ========================================================== */
-        window.playTrack = async function(id) {
+        window.playTrack = function(id) {
             let track = tracks.find(t => t.id === id);
             if (!track) {
                 for (const listName in playlistsData) {
@@ -645,64 +720,85 @@
             trackArtistDisplay.textContent = track.artist;
             currentAlbumArt.src = track.image || 'https://placehold.co/150x150/3c1e0a/ffb450?text=Music';
 
-            const activeJobId = track.id;
             if (artLoader) artLoader.classList.remove('hidden');
 
-            try {
-                let streamSrc = null;
+            const vid = extractVideoID(track.ytUrl || track.url) || (track.isYoutube ? track.id.replace('yt_pl_', '').replace('yt_bulk_', '').split('_')[0] : null);
 
-                if (track.isYoutube) {
-                    const videoId = extractVideoID(track.ytUrl) || track.id.replace('yt_pl_', '').replace('yt_bulk_', '').split('_')[0];
-                    streamSrc = await fetchAdFreeAudioStreamUrl(videoId);
-                } else if (track.url) {
-                    streamSrc = track.url;
+            if (vid) {
+                activePlayerType = 'youtube';
+                htmlAudio.pause();
+
+                if (ytPlayer && ytPlayerReady && typeof ytPlayer.loadVideoById === 'function') {
+                    try {
+                        ytPlayer.unMute();
+                        ytPlayer.setVolume(Math.round(currentVolume * 100));
+                        ytPlayer.loadVideoById(vid);
+                        ytPlayer.playVideo();
+                    } catch(e) {
+                        console.error("Playback start error:", e);
+                        pendingVideoId = vid;
+                    }
+                } else {
+                    pendingVideoId = vid;
+                    initYouTubePlayer();
                 }
+            } else if (track.url) {
+                activePlayerType = 'html5';
+                if (ytPlayer && ytPlayerReady && typeof ytPlayer.pauseVideo === 'function') {
+                    ytPlayer.pauseVideo();
+                }
+                stopYTProgressLoop();
 
-                if (currentTrackId !== activeJobId) return;
-
-                if (streamSrc) {
-                    audio.src = streamSrc;
-                    audio.load();
-                    await audio.play();
+                htmlAudio.src = track.url;
+                htmlAudio.load();
+                htmlAudio.play().then(() => {
                     isPlaying = true;
                     setPlayIcon(true);
-                }
-            } catch (err) {
-                console.warn("Playback error handled:", err);
-            } finally {
-                if (artLoader) artLoader.classList.add('hidden');
-                updateActiveTrackUI();
+                    if (artLoader) artLoader.classList.add('hidden');
+                }).catch(e => {
+                    console.warn(e);
+                    if (artLoader) artLoader.classList.add('hidden');
+                });
             }
 
+            updateActiveTrackUI();
             renderPlaylist();
         };
 
-        // Play/Pause বাটনের লজিক
+        // Play/Pause হ্যান্ডলার
         playPauseBtn.addEventListener('click', () => {
-            if (!audio.src) {
-                if (tracks.length > 0) {
-                    playTrack(tracks[0].id);
-                }
-                return;
-            }
+            if (tracks.length === 0) return;
+            if (!currentTrackId) currentTrackId = tracks[0].id;
 
-            if (audio.paused) {
-                audio.play().then(() => {
-                    isPlaying = true;
-                    setPlayIcon(true);
-                    updateActiveTrackUI();
-                }).catch(e => console.log(e));
+            if (activePlayerType === 'youtube') {
+                if (!ytPlayer || !ytPlayerReady) {
+                    playTrack(currentTrackId);
+                    return;
+                }
+
+                const state = ytPlayer.getPlayerState();
+                if (state === YT.PlayerState.PLAYING) {
+                    ytPlayer.pauseVideo();
+                } else {
+                    ytPlayer.playVideo();
+                }
             } else {
-                audio.pause();
-                isPlaying = false;
-                setPlayIcon(false);
-                updateActiveTrackUI();
+                if (!htmlAudio.src) {
+                    playTrack(currentTrackId);
+                    return;
+                }
+
+                if (htmlAudio.paused) {
+                    htmlAudio.play();
+                } else {
+                    htmlAudio.pause();
+                }
             }
         });
 
         function playNextTrack() {
             if (tracks.length === 0) return;
-            
+
             if (repeatMode === 'one') {
                 playTrack(currentTrackId);
                 return;
@@ -735,7 +831,11 @@
             if (currentIndex > 0) {
                 playTrack(tracks[currentIndex - 1].id);
             } else {
-                audio.currentTime = 0;
+                if (activePlayerType === 'youtube' && ytPlayer && ytPlayerReady) {
+                    ytPlayer.seekTo(0, true);
+                } else {
+                    htmlAudio.currentTime = 0;
+                }
             }
         }
 
@@ -779,41 +879,52 @@
             });
         }
 
-        // অডিও ইভেন্টস
-        audio.addEventListener('play', () => {
-            isPlaying = true;
-            setPlayIcon(true);
-            updateActiveTrackUI();
-        });
-
-        audio.addEventListener('pause', () => {
-            isPlaying = false;
-            setPlayIcon(false);
-            updateActiveTrackUI();
-        });
-
-        audio.addEventListener('timeupdate', () => {
-            if (!isNaN(audio.duration) && audio.duration > 0) {
-                const percentage = (audio.currentTime / audio.duration) * 100;
-                updateProgressBar(percentage);
-                currentTimeDisplay.textContent = formatTime(audio.currentTime);
-                totalTimeDisplay.textContent = formatTime(audio.duration);
+        // HTML5 Audio ইভেন্ট
+        htmlAudio.addEventListener('play', () => {
+            if (activePlayerType === 'html5') {
+                isPlaying = true;
+                setPlayIcon(true);
+                updateActiveTrackUI();
             }
         });
 
-        audio.addEventListener('ended', playNextTrack);
+        htmlAudio.addEventListener('pause', () => {
+            if (activePlayerType === 'html5') {
+                isPlaying = false;
+                setPlayIcon(false);
+                updateActiveTrackUI();
+            }
+        });
 
-        // প্রোগ্রেস ও সাউন্ড বার ড্র্যাগ/ক্লিক হ্যান্ডলার
-        function seekAudio(e) {
+        htmlAudio.addEventListener('timeupdate', () => {
+            if (activePlayerType === 'html5' && !isNaN(htmlAudio.duration) && htmlAudio.duration > 0) {
+                const percentage = (htmlAudio.currentTime / htmlAudio.duration) * 100;
+                updateProgressBar(percentage);
+                currentTimeDisplay.textContent = formatTime(htmlAudio.currentTime);
+                totalTimeDisplay.textContent = formatTime(htmlAudio.duration);
+            }
+        });
+
+        htmlAudio.addEventListener('ended', () => {
+            if (activePlayerType === 'html5') playNextTrack();
+        });
+
+        // প্রোগ্রেস ও ভলিউম বার ক্লিক
+        progressContainer.addEventListener('click', (e) => {
             const rect = progressContainer.getBoundingClientRect();
             const pos = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-            if (!isNaN(audio.duration) && audio.duration > 0) {
-                audio.currentTime = pos * audio.duration;
+
+            if (activePlayerType === 'youtube' && ytPlayer && ytPlayerReady && typeof ytPlayer.getDuration === 'function') {
+                const dur = ytPlayer.getDuration();
+                if (dur > 0) {
+                    ytPlayer.seekTo(pos * dur, true);
+                    updateProgressBar(pos * 100);
+                }
+            } else if (activePlayerType === 'html5' && !isNaN(htmlAudio.duration) && htmlAudio.duration > 0) {
+                htmlAudio.currentTime = pos * htmlAudio.duration;
                 updateProgressBar(pos * 100);
             }
-        }
-
-        progressContainer.addEventListener('click', seekAudio);
+        });
 
         volumeContainer.addEventListener('click', (e) => {
             const rect = volumeContainer.getBoundingClientRect();
@@ -839,17 +950,25 @@
                 playPauseBtn.click();
             } else if (e.code === 'ArrowRight') {
                 e.preventDefault();
-                audio.currentTime = Math.min(audio.duration || 0, audio.currentTime + 5);
+                if (activePlayerType === 'youtube' && ytPlayer && ytPlayerReady) {
+                    ytPlayer.seekTo(ytPlayer.getCurrentTime() + 5, true);
+                } else if (activePlayerType === 'html5') {
+                    htmlAudio.currentTime = Math.min(htmlAudio.duration || 0, htmlAudio.currentTime + 5);
+                }
             } else if (e.code === 'ArrowLeft') {
                 e.preventDefault();
-                audio.currentTime = Math.max(0, audio.currentTime - 5);
+                if (activePlayerType === 'youtube' && ytPlayer && ytPlayerReady) {
+                    ytPlayer.seekTo(Math.max(0, ytPlayer.getCurrentTime() - 5), true);
+                } else if (activePlayerType === 'html5') {
+                    htmlAudio.currentTime = Math.max(0, htmlAudio.currentTime - 5);
+                }
             } else if (e.code === 'KeyM') {
                 e.preventDefault();
                 muteIcon.click();
             }
         });
 
-        // রেন্ডার প্লেলিস্ট UI
+        // প্লেলিস্ট রেন্ডারিং
         function renderPlaylist() {
             const container = document.getElementById('playlist-items');
             if (!container) return;
@@ -861,7 +980,7 @@
                 container.innerHTML = `
                     <div class="text-center py-10 text-gray-400 text-xs">
                         <i class="fas fa-music text-2xl mb-2 opacity-50 block"></i>
-                        কোনো গান নেই। ওপরের বাটনে ক্লিক করে গান যোগ করুন।
+                        কোনো গান নেই। ওপরের ইউজার আইকনে ক্লিক করে গান যোগ করুন।
                     </div>
                 `;
             } else {
@@ -1057,7 +1176,7 @@
 
         closeAddModalBtn.addEventListener('click', () => addModal.classList.add('hidden'));
 
-        // সিঙ্গেল গান যোগ করা
+        // একক গান যোগ
         addSongForm.addEventListener('submit', (e) => {
             e.preventDefault();
             const url = document.getElementById('input-song-url').value.trim();
@@ -1079,9 +1198,11 @@
                 image: isYt ? `https://img.youtube.com/vi/${ytId}/hqdefault.jpg` : 'https://placehold.co/150x150/3c1e0a/ffb450?text=Music'
             };
 
-            if (playlistsData[category]) playlistsData[category].push(newTrack);
+            if (!playlistsData[category]) playlistsData[category] = [];
+            playlistsData[category].push(newTrack);
             refreshAllTracks();
             localStorage.setItem('agomoni_user_tracks', JSON.stringify(playlistsData));
+            
             selectCategory(category);
             playTrack(newTrack.id);
 
@@ -1089,7 +1210,7 @@
             addModal.classList.add('hidden');
         });
 
-        // মেটাডাটা ফেচ ফাংশন
+        // মেটাডাটা ফেচ
         async function fetchVideoMetadata(videoId) {
             try {
                 const res = await fetch(`https://noembed.com/embed?url=https://www.youtube.com/watch?v=${videoId}`, { signal: AbortSignal.timeout(3500) });
@@ -1269,7 +1390,7 @@
             }, 800);
         });
 
-        // ইনিশিয়ালাইজেশন
+        // শুরু করা
         if (tracks.length > 0) {
             const initialTrack = tracks[0];
             currentTrackId = initialTrack.id;
